@@ -5,57 +5,54 @@ import cProfile
 import json
 import timeit
 import os
-import urllib, urllib2
 import pytest
-import glob
-import datetime
-import pickle
-import collections
-import sys
+
+class Benchmark():
+
+    def __init__(self, int_ops=7000000, float_ops=7500000, atan_ops=75000, sort_ops=5000):
+        # These values run approx. 1 second on Macbook Air 2014 (1.4GHz i5)
+        # They ought to be synchronized to the Travis-CI Machine
+        self.times = []
+        self.int_ops = int_ops
+        self.float_ops = float_ops
+        self.atan_ops = atan_ops
+        self.sort_ops = sort_ops
+
+    def update(self):
+        int_time = timeit.timeit('100 * 99 + 5', number=self.int_ops)
+        float_time = timeit.timeit('100.5 * 99.2 * 98.6 * 97.1', number=self.float_ops)
+        atan_time = timeit.timeit('import random, math; math.atan2(random.random(), random.random())', number=self.atan_ops)
+        sort_time = timeit.timeit('sorted(reversed(xrange(1000)))', number=self.sort_ops)
+        threshold = int_time + float_time + atan_time + sort_time
+        self.times.append(threshold)
+    @property
+    def average(self):
+        if len(self.times) is 0:
+            raise ValueError('Cannot request benchmark before calling update.')
+        return sum(self.times) / len(self.times)
+
 
 # Module level, to pass state across tests.  This is not multiprocessing-safe.
 function_profile_list = []
-profile_flag = False
-codespeed_flag = False
-submit_url = None
-commit = None
-branch = None
-environment = None
+enabled = False
+benchmark = Benchmark()
 
 
 def pytest_addoption(parser):
     profile_group = parser.getgroup('Performance Profiling', description='Use cProfile to profile execution times of test_* functions.')
-    profile_group.addoption('--profile', dest='profile', action='store_true',
-                     default=None, help='Store execution times locally and compare with previous runs.')
-    profile_group.addoption('--code-speed-submit', dest='cs_url', action='store',
-                     default=None, help='Submit results as JSON to Codespeed instance at URL. ' + \
-                     "Must be accompanied by --branch, --commit, and --environment arguments.")
-    profile_group.addoption('--branch', dest='branch', action='store',
-                     default=None, help='Specify Codespeed "Branch" setting.')
-    profile_group.addoption('--commit', dest='commit', action='store',
-                     default=None, help='Specify Codespeed "Commit ID" setting.')
-    profile_group.addoption('--environment', dest='env', action='store',
-                     default=None, help='Specify Codespeed "Environment" setting.')
-
+    profile_group.addoption('--travis-profile', dest='profile', action='store_true',
+                            default=False, help='Generate function profiles.')
 
 def pytest_configure(config):
     """
     Called before tests are collected.
     """
-    global codespeed_flag, profile_flag, submit_url, commit, branch, environment
+    global enabled, benchmark
 
-    # enabled = config.getoption('profile') or config.getoption('cs_submit_url') is not None
-    profile_flag = config.getoption('profile')
-    codespeed_flag = config.getoption('cs_url') is not None
-    submit_url = config.getoption('cs_url')
-    commit = config.getoption('commit')
-    branch = config.getoption('branch')
-    environment = config.getoption('env')
+    if enabled:
+        benchmark.update()
 
-    missing_argument = not commit or not branch or not environment
-    if submit_url and missing_argument:
-        raise ValueError("If calling with --code-speed-submit, user must supply " +\
-                         "--commit, --branch, and --environment arguments.")
+    enabled = config.getoption('profile')
 
 
 @pytest.mark.hookwrapper
@@ -63,20 +60,19 @@ def pytest_runtest_call(item):
     """
     Calls once per test.
     """
-    global function_profile_list, profile_flag, codespeed_flag
+    global function_profile_list, enabled
 
-    item.profile_flag = profile_flag
-    item.codespeed_flag = codespeed_flag
+    item.enabled = enabled
     item.profiler = cProfile.Profile()
 
-    item.profiler.enable() if item.profile_flag or item.codespeed_flag else None
+    item.profiler.enable() if item.enabled else None
     outcome = yield
-    item.profiler.disable() if item.profile_flag or item.codespeed_flag else None
+    item.profiler.disable() if item.enabled else None
 
     result = None if outcome is None else outcome.get_result()
 
     # Item's excinfo will indicate any exceptions thrown
-    if item.profile_flag and item._excinfo is None:
+    if item.enabled and item._excinfo is None:
         # item.listnames() returns list of form: ['PyOpenWorm', 'tests/CellTest.py', 'CellTest', 'test_blast_space']
         fp = FunctionProfile(cprofile=item.profiler, function_name=item.listnames()[-1])
         function_profile_list.append(fp)
@@ -86,110 +82,22 @@ def pytest_unconfigure(config):
     """
     Called after all tests are completed.
     """
-    global codespeed_flag, profile_flag, submit_url, commit, branch, environment
+    global enabled, benchmark
 
-    # Chee
-    if profile_flag:
-        dump_and_compare()
+    if not enabled:
+        return
 
-    if codespeed_flag:
-        data_int = map(lambda x: x.to_codespeed_dict(commit=commit,
-                                                     branch=branch,
-                                                     environment=environment,
-                                                     benchmark="int"),
-                       function_profile_list)
-        data_flt = map(lambda x: x.to_codespeed_dict(commit=commit,
-                                                     branch=branch,
-                                                     environment=environment,
-                                                     benchmark="float"),
-                       function_profile_list)
+    benchmark.update()
+    threshold = benchmark.average
 
-        int_time = timeit.timeit('100 * 99', number=500)
-        float_time = timeit.timeit('100.5 * 99.2', number=500)
+    print '[Machine Benchmark Time]: {:.2f}s'.format(threshold)
 
-        for elt in data_int:
-            # Result should be factor of int operation time
-            elt["result_value"] = elt["result_value"] / int_time
-        for elt in data_flt:
-            # Result should be factor of int operation time
-            elt["result_value"] = elt["result_value"] / float_time
+    violating_functions = []
 
-        data = data_int + data_flt
-
-        try:
-            f = urllib2.urlopen(submit_url + 'result/add/json/',
-                                urllib.urlencode({'json': json.dumps(data)}))
-            response = f.read()
-        except urllib2.HTTPError as e:
-            print 'Error while connecting to Codespeed:'
-            print 'Exception: {}'.format(str(e))
-            print 'HTTP Response: {}'.format(e.read())
-            raise e
-
-        if not response.startswith('All result data saved successfully'):
-            print "Unexpected response while connecting to Codespeed:"
-            raise ValueError('Unexpected response from Codespeed server: {}'.format(response))
-        else:
-            print "{} test benchmarks sumbitted.".format(len(function_profile_list))
-
-
-
-def dump_and_compare():
-    global function_profile_list
-    root_dir = os.path.dirname(__file__)
-    utc_time_str = datetime.datetime.utcnow().strftime('%Y-%m-%d-%H-%M-%S')
-    # TODO Add git branch to filename
-    filename = 'pyopenworm_profile_{}.pkl'.format(utc_time_str)
-    file_glob = 'pyopenworm_profile_*.pkl'
-    directory_path = os.path.join(root_dir, 'test_data', 'test_profiles')
-    relative_path = os.path.join(directory_path, filename)
-    try:
-        os.mkdir(directory_path)  # Create directory if not present
-    except OSError:
-        pass
-    with open(relative_path, 'w') as f:
-        pickle.dump(function_profile_list, f)
-    if True:
-        compare_stats(glob.glob(os.path.join(directory_path, file_glob)))
-
-
-def compare_stats(files, scale_threshold=1.05):
-    """
-    :param files: List of files, relative or absolute path
-    """
-    z = []
-    for index, file in enumerate(sorted(files)):
-        with open(file, 'r') as f:
-            z.append(pickle.load(f))
-        if index == len(files) - 1:
-            # Last test, record which tests were run this time
-            this_run = set(map(lambda x: x.function_name, z[-1]))
-
-    performance_dict = collections.defaultdict(lambda: [])
-    for full_run in z:
-        for test in full_run:
-            performance_dict[test.function_name].append(test)
-
-    for name, lst in performance_dict.iteritems():
-        if len(lst) <= 1 or name not in this_run:
-            continue
-        current = lst[-1]
-        previous = lst[-2]
-        if current.cumulative_time > previous.cumulative_time * scale_threshold:
-            sys.stdout.write('+ <{0}> execution time has increased {1:0.2f}% from {2} ms to {3} ms.\n'.format(
-                name,
-                current.cumulative_time / previous.cumulative_time * 100,
-                previous.cumulative_time * 1000.0,
-                current.cumulative_time * 1000.0,
-            ))
-        elif current.cumulative_time * scale_threshold < previous.cumulative_time:
-            sys.stdout.write('- <{0}> execution time has sped up {1:0.02f}x from {2} ms to {3} ms.\n'.format(
-                name,
-                previous.cumulative_time / current.cumulative_time,
-                previous.cumulative_time * 1000.0,
-                current.cumulative_time * 1000.0,
-            ))
-
+    for func in function_profile_list:
+        if func.cumulative_time > threshold:
+            print '   [Performance Warning]: {} @ {:.2f}s'.format(func.function_name, func.cumulative_time)
+            violating_functions.append(func)
 
 
 
